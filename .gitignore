@@ -4,7 +4,7 @@
 #
 
 # custom
-.envrc
+part1/.envrc
 
 # Binaries for programs and plugins
 *.exe

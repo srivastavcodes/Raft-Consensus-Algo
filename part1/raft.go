@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	_          = godotenv.Load("../.envrc")
+	_          = godotenv.Load(".envrc")
 	DebugCM, _ = strconv.Atoi(os.Getenv("DebugCM"))
 )
 
