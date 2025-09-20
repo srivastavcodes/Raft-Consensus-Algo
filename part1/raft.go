@@ -8,9 +8,14 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
-var DebugCM, _ = strconv.Atoi(os.Getenv("DEBUG_CM"))
+var (
+	_          = godotenv.Load("../.envrc")
+	DebugCM, _ = strconv.Atoi(os.Getenv("DebugCM"))
+)
 
 type LogEntry struct {
 	Command any
