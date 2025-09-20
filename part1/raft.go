@@ -111,6 +111,35 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// RequestVote verifies the term, and if it hasn't already voted to another candidate
+// grants a vote to the current candidate.
+// Resets the election event and prepares the RequestVoteReply.
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlogf("ReqeustVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+
+	if args.Term > cm.currentTerm {
+		cm.dlogf("greater term in RequestVote args")
+		cm.becomeFollower(args.Term)
+	}
+	reply.VoteGranted = false
+
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	}
+	reply.Term = cm.currentTerm
+
+	cm.dlogf("RequestVote reply: %+v", reply)
+	return nil
+}
+
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
@@ -121,9 +150,61 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term        int
-	VoteGranted bool
+	Term    int
+	Success bool
 }
+
+// AppendEntries handles AppendEntry RPCs from leaders for log replication and heartbeats.
+// Updates term if higher, transitions to Follower if needed, and resets election timer.
+// Returns success only if term matches current term.
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlogf("AppendEntries: %+v", args)
+
+	if args.Term > cm.currentTerm {
+		cm.dlogf("greater term in AppendEntries args")
+		cm.becomeFollower(args.Term)
+	}
+	reply.Success = false
+
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+		reply.Success = true
+	}
+	reply.Term = cm.currentTerm
+	cm.dlogf("AppendEntries reply: %+v", reply)
+	return nil
+}
+
+/*
+	Raft guarantees that only a single leader exists in any given term, so if a
+	peer finds itself as anything other than a follower during AppendEntry rpc
+	from a legitimate leader, it's forced to become a follower.
+
+	if cm.state != Follower {
+		cm.becomeFollower(args.Term)
+	}
+	- Candidate → Follower: If this server is currently a Candidate running an
+	election, but receives a valid AppendEntries from a legitimate leader,
+	it should abandon its candidacy and become a follower of the established
+	leader.
+
+	- Leader → Follower: If this server thinks it's a Leader but receives a
+	valid AppendEntries from another server with the same term, it means
+	there's another legitimate leader (split-brain scenario). It should step down
+	and become a follower.
+
+	- Already Follower: If it's already a Follower, the condition is false and
+	no state change occurs,which is correct.
+*/
 
 // electionTimeout generates a pseudo-random election timeout duration.
 func (cm *ConsensusModule) electionTimeout() time.Duration {
@@ -155,7 +236,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
 	cm.mu.Unlock()
-	cm.dlogf("election timer started (%v), term=%id", timeoutDuration, termStarted)
+	cm.dlogf("election timer started (%v), term=%d", timeoutDuration, termStarted)
 
 	// This loops until either:
 	// - we discover the election timer is no longer needed, or the election
@@ -302,6 +383,10 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	}
 }
 
+// becomeFollower transitions the CM to Follower state with the given term.
+// Resets voting state, updates election timer, and starts a new election
+// timer.
+// Expects cm.mu to be locked.
 func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.dlogf("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
