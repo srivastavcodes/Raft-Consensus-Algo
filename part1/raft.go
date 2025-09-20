@@ -41,7 +41,7 @@ func (state CMState) String() string {
 	}
 }
 
-// ConsensusModule (CM) implements a single node of Raft Consensus.
+// ConsensusModule implements a single node of Raft Consensus.
 type ConsensusModule struct {
 	// mu protects concurrent access to CM.
 	mu sync.Mutex
@@ -66,8 +66,8 @@ type ConsensusModule struct {
 	electionResetEvent time.Time
 }
 
-// NewConsensusModule creates a new CM with the given ID, list of peerIds and server.
-// The ready channel signals the CM that all peers are connected, and it's safe to
+// NewConsensusModule creates a new ConsensusModule with the given ID, list of peerIds and server.
+// The ready channel signals the ConsensusModule that all peers are connected, and it's safe to
 // start its state machine.
 func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any) *ConsensusModule {
 	cm := &ConsensusModule{
@@ -87,6 +87,23 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any)
 		cm.runElectionTimer()
 	}()
 	return cm
+}
+
+// Report reports the state of this ConsensusModule.
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+// Stop stops this ConsensusModule, cleaning up its state. This method returns
+// quickly, but it may take a bit of time (up to ~electionTimeout) for all
+// goroutines to exit
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = Dead
+	cm.dlogf("[%d] becomes dead", cm.id)
 }
 
 // dlogf logs a debugging message if DebugCM > 0
@@ -230,7 +247,7 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 //
 // This function is blocking and should be launched in a different goroutine; it's
 // designed to work for a single (one-shot) election timer, as it exits whenever
-// the CM state changes from follower/candidate or the term changes.
+// the ConsensusModule state changes from follower/candidate or the term changes.
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
@@ -278,7 +295,8 @@ Things we need to run an election:
 	3. Wait for replies to these RPCs and count if we got enough votes to become a leader.
 */
 
-// startElection starts a new election with this CM as a candidate. Expects cm.mu to be locked
+// startElection starts a new election with this ConsensusModule as a candidate.
+// Expects cm.mu to be locked
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
@@ -331,7 +349,7 @@ func (cm *ConsensusModule) startElection() {
 	go cm.runElectionTimer()
 }
 
-// startLeader switches CM into a leader state and begins the process of heartbeats.
+// startLeader switches ConsensusModule into a leader state and begins the process of heartbeats.
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
@@ -354,7 +372,7 @@ func (cm *ConsensusModule) startLeader() {
 }
 
 // leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
-// replies and adjusts CM's state
+// replies and adjusts ConsensusModule state
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
@@ -383,7 +401,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	}
 }
 
-// becomeFollower transitions the CM to Follower state with the given term.
+// becomeFollower transitions the ConsensusModule to Follower state with the given term.
 // Resets voting state, updates election timer, and starts a new election
 // timer.
 // Expects cm.mu to be locked.
