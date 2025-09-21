@@ -17,9 +17,24 @@ var (
 	DebugCM, _ = strconv.Atoi(os.Getenv("DebugCM"))
 )
 
-type LogEntry struct {
+/*
+	In our implementation, when a ConsensusModule is created, it takes in a commit
+	channel - a channel which it uses to send committed commands to the caller:
+	commitChan chan <- CommitEntry
+*/
+
+// CommitEntry is the data reported by Raft to the commit channel. Each commit
+// entry notifies the client that consensus was reached on a command, and it
+// can be applied to the client's state machine.
+type CommitEntry struct {
+	// Command is the client command being committed
 	Command any
-	Term    int
+
+	// Index is the log index at which the client command is committed.
+	Index int
+
+	// Term is the Raft term at which the client command was committed.
+	Term int
 }
 
 type CMState int
@@ -46,6 +61,11 @@ func (state CMState) String() string {
 	}
 }
 
+type LogEntry struct {
+	Command any
+	Term    int
+}
+
 // ConsensusModule implements a single node of Raft Consensus.
 type ConsensusModule struct {
 	// mu protects concurrent access to CM.
@@ -57,9 +77,18 @@ type ConsensusModule struct {
 	// peerIds lists the IDs of our peers in the cluster.
 	peerIds []int
 
-	// server is the server containing this CM. It's used
-	// issue RPC calls to peers.
+	// server is the server containing this CM. It's used issue RPC calls
+	// to peers.
 	server *Server
+
+	// commitChan is the channel where this CM is going to report committed
+	// log entries. It's passed in by the client during construction.
+	commitChan chan<- CommitEntry
+
+	// newCommitReadyChan is an internal notification channel used by goroutines
+	// that commit new entries to the log to notify that these entries may be
+	// sent on commitChan.
+	newCommitReadyChan chan struct{}
 
 	// Persistent Raft state on all servers.
 	currentTerm int
@@ -67,8 +96,14 @@ type ConsensusModule struct {
 	log         []LogEntry
 
 	// Volatile Raft state on all servers.
+	commitIndex        int
+	lastApplied        int
 	state              CMState
 	electionResetEvent time.Time
+
+	// Volatile Raft state on leaders.
+	nextIndex  map[int]int
+	matchIndex map[int]int
 }
 
 // NewConsensusModule creates a new ConsensusModule with the given ID, list of peerIds and server.
