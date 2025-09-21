@@ -49,13 +49,13 @@ const (
 func (state CMState) String() string {
 	switch state {
 	case StateFollower:
-		return "StateFollower"
+		return "Follower"
 	case StateCandidate:
-		return "StateCandidate"
+		return "Candidate"
 	case StateLeader:
-		return "StateLeader"
+		return "Leader"
 	case StateDead:
-		return "StateDead"
+		return "Dead"
 	default:
 		panic("what you doin? Not a recognised state!")
 	}
@@ -109,13 +109,23 @@ type ConsensusModule struct {
 // NewConsensusModule creates a new ConsensusModule with the given ID, list of peerIds and server.
 // The ready channel signals the ConsensusModule that all peers are connected, and it's safe to
 // start its state machine.
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := &ConsensusModule{
-		id:       id,
-		peerIds:  peerIds,
-		server:   server,
-		votedFor: -1,
-		state:    StateFollower,
+		id:      id,
+		peerIds: peerIds,
+
+		server: server,
+		state:  StateFollower,
+
+		votedFor:    -1,
+		commitIndex: -1,
+		lastApplied: -1,
+
+		commitChan:         commitChan,
+		newCommitReadyChan: make(chan struct{}, 16),
+
+		nextIndex:  make(map[int]int),
+		matchIndex: make(map[int]int),
 	}
 	go func() {
 		// The CM is quiescent until ready is signaled; then it starts
@@ -126,6 +136,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any)
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
+	// todo: go cm.commitChanSender()
 	return cm
 }
 
@@ -134,6 +145,26 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == StateLeader
+}
+
+// Submit submits a new command to the ConsensusModule. This function doesn't block;
+// client read the commit channel passed in the constructor to be notified of new
+// committed entries.
+//
+// It returns true if this ConsensusModule is the leader - in which case the command
+// is accepted. If false is returned, the client will have to find a different
+// ConsensusModule to submit this command to.
+func (cm *ConsensusModule) Submit(command any) bool {
+	cm.mu.Lock()
+	defer cm.mu.Lock()
+	cm.dlogf("Submit received by %v: %v", cm.state, command)
+
+	if cm.state == StateLeader {
+		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.dlogf("log=%v", cm.log)
+		return true
+	}
+	return false
 }
 
 // Stop stops this ConsensusModule, cleaning up its state. This method returns
@@ -419,22 +450,71 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Unlock()
 
 	for _, peerId := range cm.peerIds {
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderId: cm.id,
-		}
 		go func() {
-			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+			cm.mu.Lock()
+			ni := cm.nextIndex[peerId]
+			var (
+				prevLogIndex = ni - 1
+				prevLogTerm  = -1
+			)
+			if prevLogIndex >= 0 {
+				prevLogTerm = cm.log[prevLogIndex].Term
+			}
+			// entries that need to be commited, found after the next index.
+			// eg: ((3..4)...9), ni = 5, [ni:] = (5..9) -> newly commited.
+			entries := cm.log[ni:]
+
+			args := AppendEntriesArgs{
+				Term:         savedCurrentTerm,
+				LeaderId:     cm.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: cm.commitIndex,
+			}
+			cm.mu.Unlock()
+			cm.dlogf("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
 
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Unlock()
+				defer cm.mu.Lock()
 
 				if reply.Term > savedCurrentTerm {
-					cm.dlogf("term greater in heartbeat reply")
+					cm.dlogf("greater term in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
+				}
+				if cm.state == StateLeader && savedCurrentTerm == reply.Term {
+					if reply.Success {
+						cm.nextIndex[peerId] = ni + len(entries)
+						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
+						cm.dlogf("AppendEntries reply from %d success: nextIndex := %+v, matchIndex := %+v",
+							peerId, cm.nextIndex, cm.matchIndex,
+						)
+						savedCommitIndex := cm.commitIndex
+
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+							if cm.log[i].Term == cm.currentTerm {
+								matchCount := 1
+								for _, peerId := range cm.peerIds {
+									if cm.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								if matchCount*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+						if cm.commitIndex != savedCommitIndex {
+							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
+							cm.newCommitReadyChan <- struct{}{}
+						}
+					} else {
+						cm.nextIndex[peerId] = ni - 1
+						cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+					}
 				}
 			}
 		}()
