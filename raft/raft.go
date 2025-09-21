@@ -136,7 +136,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any,
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
-	// todo: go cm.commitChanSender()
+	go cm.commitChanSender()
 	return cm
 }
 
@@ -502,6 +502,8 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 										matchCount++
 									}
 								}
+								// if a certain log-index is replicated by the majority, commitIndex
+								// advanced to it.
 								if matchCount*2 > len(cm.peerIds)+1 {
 									cm.commitIndex = i
 								}
@@ -532,4 +534,33 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.votedFor = -1
 	cm.electionResetEvent = time.Now()
 	go cm.runElectionTimer()
+}
+
+func (cm *ConsensusModule) commitChanSender() {
+	for range cm.newCommitReadyChan {
+		// find which entries we have to apply
+		cm.mu.Lock()
+
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+
+		var entries []LogEntry
+		if cm.commitIndex > cm.lastApplied {
+			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+		cm.dlogf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Term:    savedTerm,
+				// we add (+i+1) because entries will only contain elements after (cm.lastApplied + 1)
+				// follow the logic of entries array creation in the if condition above.
+				Index: savedLastApplied + i + 1,
+			}
+		}
+	}
+	cm.dlogf("commitChanSender done")
 }
