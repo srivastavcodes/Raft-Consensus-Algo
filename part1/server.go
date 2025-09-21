@@ -32,7 +32,7 @@ type Server struct {
 	listener    net.Listener
 	peerClients map[int]*rpc.Client
 	ready       <-chan any
-	quit        chan any
+	quitch      chan struct{}
 	wg          sync.WaitGroup
 }
 
@@ -42,8 +42,8 @@ func NewServer(serverId int, peerIds []int, ready <-chan any) *Server {
 		peerIds:     peerIds,
 		peerClients: make(map[int]*rpc.Client),
 
-		ready: ready,
-		quit:  make(chan any),
+		ready:  ready,
+		quitch: make(chan struct{}),
 	}
 }
 
@@ -78,7 +78,7 @@ func (srv *Server) Serve() {
 			conn, err := srv.listener.Accept()
 			if err != nil {
 				select {
-				case <-srv.quit:
+				case <-srv.quitch:
 					return
 				default:
 					log.Fatal("accept error:", err)
@@ -109,7 +109,7 @@ func (srv *Server) DisconnectAll() {
 // Shutdown closes the server and waits for it to shut down properly.
 func (srv *Server) Shutdown() {
 	srv.cm.Stop()
-	close(srv.quit)
+	close(srv.quitch)
 	srv.listener.Close()
 	srv.wg.Wait()
 }
