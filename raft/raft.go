@@ -364,9 +364,12 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	and become a follower.
 
 	- Already StateFollower: If it's already a StateFollower, the condition is false and
-	no state change occurs,which is correct.
+	no state change occurs, which is correct.
 */
 
+// restoreFromStorage restores the persistent state of this ConsensusModule
+// from the storage. It should be called during constructor, before any
+// concurrency concerns.
 func (cm *ConsensusModule) restoreFromStorage() {
 	if termData, ok := cm.storage.Get("currentTerm"); ok {
 		data := gob.NewDecoder(bytes.NewBuffer(termData))
@@ -394,6 +397,26 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
+}
+
+func (cm *ConsensusModule) persisToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatalf("failed to encode currentTerm. err=%v", err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatalf("failed to encode votedFor. err=%v", err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatalf("failed to encode log. err=%v", err)
+	}
+	cm.storage.Set("log", logData.Bytes())
 }
 
 // runElectionTimer implements an election timer, it should be launched whenever we
