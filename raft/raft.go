@@ -209,15 +209,19 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == StateDead {
 		return nil
 	}
-	cm.dlogf("ReqeustVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
-
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dlogf("ReqeustVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]",
+		args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm,
+	)
 	if args.Term > cm.currentTerm {
 		cm.dlogf("greater term in RequestVote args")
 		cm.becomeFollower(args.Term)
 	}
 	reply.VoteGranted = false
 
-	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
+
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateId
 		cm.electionResetEvent = time.Now()
@@ -242,7 +246,20 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-// todo: re-read the AppendEntries section of the part-2 and write a bookmark for the bullet-points.
+/*
+When a leader sends new log entries with AppendEntries, the following happens:
+	1. A follower appends the new entries to its logs and replies success=true to the leader.
+	2. As a result, the leader updates its matchIndex for this follower.
+	3. When enough followers have their matchIndex at the nextIndex, leader updates its
+	  commitIndex and sends it to all its followers in the next AppendEntries call
+	  (in the leaderCommit field) - which probably will be a heartbeat.
+	4. For followers - if leaderCommit > (what they have), means new log entries are committed,
+	  and they can send them to their clients on the commit channel.
+
+Total of two RPC calls to commit a new command:
+	(1) To send logs and get AE reply.
+	(2) To send updated commitIndex to followers.
+*/
 
 // AppendEntries handles AppendEntry RPCs from leaders for log replication and heartbeats.
 // Updates term if higher, transitions to StateFollower if needed, and resets election timer.
@@ -425,15 +442,22 @@ func (cm *ConsensusModule) startElection() {
 
 	votesReceived := 1
 
+	// Send requests to RPCs to all the other servers concurrently.
 	for _, peerId := range cm.peerIds {
 		go func() {
-			args := RequestVoteArgs{
-				Term:        savedCurrentTerm,
-				CandidateId: cm.id,
-			}
-			var reply RequestVoteReply
+			cm.mu.Lock()
+			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+			cm.mu.Unlock()
 
+			args := RequestVoteArgs{
+				Term:         savedCurrentTerm,
+				CandidateId:  cm.id,
+				LastLogIndex: savedLastLogIndex,
+				LastLogTerm:  savedLastLogTerm,
+			}
 			cm.dlogf("sending RequestVote to %d: %+v", peerId, args)
+
+			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
@@ -579,6 +603,18 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.votedFor = -1
 	cm.electionResetEvent = time.Now()
 	go cm.runElectionTimer()
+}
+
+// lastLogIndexAndTerm returns the last log index and the last log entry's term
+// (or -1 if there's no log) for this server.
+// Expects cm.mu to be locked
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		return lastIndex, cm.log[lastIndex].Term
+	} else {
+		return -1, -1
+	}
 }
 
 // commitChanSender is responsible for sending committed entries on cm.commitChan.
