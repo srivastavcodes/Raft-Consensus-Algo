@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -66,6 +68,12 @@ type LogEntry struct {
 	Term    int
 }
 
+/*
+	We lock the ConsensusModule struct everytime we access its fields, it is essential
+	because the implementation tries to be as synchronous as possible.
+	Meaning sequential code is sequential, and not split across multiple event handlers.
+*/
+
 // ConsensusModule implements a single node of Raft Consensus.
 type ConsensusModule struct {
 	// mu protects concurrent access to CM.
@@ -81,6 +89,9 @@ type ConsensusModule struct {
 	// to peers.
 	server *Server
 
+	// storage is used to persist state.
+	storage Storage
+
 	// commitChan is the channel where this CM is going to report committed
 	// log entries. It's passed in by the client during construction.
 	commitChan chan<- CommitEntry
@@ -88,7 +99,16 @@ type ConsensusModule struct {
 	// newCommitReadyChan is an internal notification channel used by goroutines
 	// that commit new entries to the log to notify that these entries may be
 	// sent on commitChan.
-	newCommitReadyChan chan struct{}
+	//
+	// A goroutine monitors this channel and sends entries on newCommitReadyChan
+	// when notified; newCommitReadyChanWg is used to wait for this goroutine to
+	// exit, to ensure a clean shutdown.
+	newCommitReadyChan   chan struct{}
+	newCommitReadyChanWg sync.WaitGroup
+
+	// triggerAEChan is an internal notification channel used to trigger sending
+	// new AppendEntries to followers when interesting changes occur.
+	triggerAEChan chan struct{}
 
 	// Persistent Raft state on all servers.
 	currentTerm int
@@ -109,23 +129,30 @@ type ConsensusModule struct {
 // NewConsensusModule creates a new ConsensusModule with the given ID, list of peerIds and server.
 // The ready channel signals the ConsensusModule that all peers are connected, and it's safe to
 // start its state machine.
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server,
+	storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *ConsensusModule {
+
 	cm := &ConsensusModule{
 		id:      id,
 		peerIds: peerIds,
 
-		server: server,
-		state:  StateFollower,
+		server:  server,
+		storage: storage,
+		state:   StateFollower,
 
 		votedFor:    -1,
 		commitIndex: -1,
 		lastApplied: -1,
 
 		commitChan:         commitChan,
+		triggerAEChan:      make(chan struct{}, 1),
 		newCommitReadyChan: make(chan struct{}, 16),
 
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
+	}
+	if cm.storage.HasData() {
+		cm.restoreFromStorage()
 	}
 	go func() {
 		// The CM is quiescent until ready is signaled; then it starts
@@ -136,15 +163,9 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan any,
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
+	cm.newCommitReadyChanWg.Add(1)
 	go cm.commitChanSender()
 	return cm
-}
-
-// Report reports the state of this ConsensusModule.
-func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == StateLeader
 }
 
 // Submit submits a new command to the ConsensusModule. This function doesn't block;
@@ -165,17 +186,6 @@ func (cm *ConsensusModule) Submit(command any) bool {
 		return true
 	}
 	return false
-}
-
-// Stop stops this ConsensusModule, cleaning up its state. This method returns
-// quickly, but it may take a bit of time (up to ~electionTimeout) for all
-// goroutines to exit
-func (cm *ConsensusModule) Stop() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.state = StateDead
-	cm.dlogf("[%d] becomes dead", cm.id)
-	close(cm.newCommitReadyChan)
 }
 
 // dlogf logs a debugging message if DebugCM > 0
@@ -357,24 +367,34 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	no state change occurs,which is correct.
 */
 
-// electionTimeout generates a pseudo-random election timeout duration.
-func (cm *ConsensusModule) electionTimeout() time.Duration {
-	// If RAFT_FORCE_MORE_REELECTION is set, stress-test by deliberately
-	// generating a hard-coded number very often.
-	// This will create collisions between different servers and force
-	// more re-elections.
-	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
-		return time.Duration(150) * time.Millisecond
+func (cm *ConsensusModule) restoreFromStorage() {
+	if termData, ok := cm.storage.Get("currentTerm"); ok {
+		data := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := data.Decode(&cm.currentTerm); err != nil {
+			log.Fatalf("hehe, blew up decoding currentTerm. err=%v", err)
+		}
 	} else {
-		return time.Duration(150+rand.Intn(150)) * time.Millisecond
+		log.Fatal("currentTerm not found in storage")
+	}
+
+	if votedData, ok := cm.storage.Get("votedFor"); ok {
+		data := gob.NewDecoder(bytes.NewBuffer(votedData))
+		if err := data.Decode(&cm.votedFor); err != nil {
+			log.Fatalf("blew up decoding votedFor, you stOOpid. err=%v", err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+
+	if logData, ok := cm.storage.Get("log"); ok {
+		data := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := data.Decode(&cm.log); err != nil {
+			log.Fatalf("decoding log is not compatible with program life. err=%v", err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
 	}
 }
-
-/*
-	We lock the ConsensusModule struct everytime we access its fields, it is essential
-	because the implementation tries to be as synchronous as possible.
-	Meaning sequential code is sequential, and not split across multiple event handlers.
-*/
 
 // runElectionTimer implements an election timer, it should be launched whenever we
 // want to start a timer towards becoming a candidate in a new election.
@@ -606,31 +626,6 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	}
 }
 
-// becomeFollower transitions the ConsensusModule to StateFollower state with the given term.
-// Resets voting state, updates election timer, and starts a new election
-// timer.
-// Expects cm.mu to be locked.
-func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.dlogf("becomes StateFollower with term=%d; log=%v", term, cm.log)
-	cm.state = StateFollower
-	cm.currentTerm = term
-	cm.votedFor = -1
-	cm.electionResetEvent = time.Now()
-	go cm.runElectionTimer()
-}
-
-// lastLogIndexAndTerm returns the last log index and the last log entry's term
-// (or -1 if there's no log) for this server.
-// Expects cm.mu to be locked
-func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
-	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
-	} else {
-		return -1, -1
-	}
-}
-
 // commitChanSender is responsible for sending committed entries on cm.commitChan.
 // It watches newCommitReadyChan for notifications and calculates which new entries
 // are ready to be sent.
@@ -665,4 +660,60 @@ func (cm *ConsensusModule) commitChanSender() {
 		}
 	}
 	cm.dlogf("commitChanSender done")
+}
+
+// becomeFollower transitions the ConsensusModule to StateFollower state with the given term.
+// Resets voting state, updates election timer, and starts a new election
+// timer.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.dlogf("becomes StateFollower with term=%d; log=%v", term, cm.log)
+	cm.state = StateFollower
+	cm.currentTerm = term
+	cm.votedFor = -1
+	cm.electionResetEvent = time.Now()
+	go cm.runElectionTimer()
+}
+
+// lastLogIndexAndTerm returns the last log index and the last log entry's term
+// (or -1 if there's no log) for this server.
+// Expects cm.mu to be locked
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		return lastIndex, cm.log[lastIndex].Term
+	} else {
+		return -1, -1
+	}
+}
+
+// electionTimeout generates a pseudo-random election timeout duration.
+func (cm *ConsensusModule) electionTimeout() time.Duration {
+	// If RAFT_FORCE_MORE_REELECTION is set, stress-test by deliberately
+	// generating a hard-coded number very often.
+	// This will create collisions between different servers and force
+	// more re-elections.
+	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
+		return time.Duration(150) * time.Millisecond
+	} else {
+		return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	}
+}
+
+// Report reports the state of this ConsensusModule.
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == StateLeader
+}
+
+// Stop stops this ConsensusModule, cleaning up its state. This method returns
+// quickly, but it may take a bit of time (up to ~electionTimeout) for all
+// goroutines to exit
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = StateDead
+	cm.dlogf("[%d] becomes dead", cm.id)
+	close(cm.newCommitReadyChan)
 }
