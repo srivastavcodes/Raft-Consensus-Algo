@@ -156,7 +156,7 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 // ConsensusModule to submit this command to.
 func (cm *ConsensusModule) Submit(command any) bool {
 	cm.mu.Lock()
-	defer cm.mu.Lock()
+	defer cm.mu.Unlock()
 	cm.dlogf("Submit received by %v: %v", cm.state, command)
 
 	if cm.state == StateLeader {
@@ -561,7 +561,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Lock()
+				defer cm.mu.Unlock()
 
 				if reply.Term > savedCurrentTerm {
 					cm.dlogf("greater term in heartbeat reply")
