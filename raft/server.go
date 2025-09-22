@@ -30,20 +30,23 @@ type Server struct {
 	rpcProxy    *RPCProxy
 	rpcServer   *rpc.Server
 	listener    net.Listener
+	commitChan  chan<- CommitEntry
 	peerClients map[int]*rpc.Client
 	ready       <-chan any
 	quitch      chan struct{}
 	wg          sync.WaitGroup
 }
 
-func NewServer(serverId int, peerIds []int, ready <-chan any) *Server {
+func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- CommitEntry) *Server {
 	return &Server{
-		serverId:    serverId,
+		serverId: serverId,
+
 		peerIds:     peerIds,
 		peerClients: make(map[int]*rpc.Client),
 
-		ready:  ready,
-		quitch: make(chan struct{}),
+		ready:      ready,
+		commitChan: commitChan,
+		quitch:     make(chan struct{}),
 	}
 }
 
@@ -55,7 +58,7 @@ func NewServer(serverId int, peerIds []int, ready <-chan any) *Server {
 
 func (srv *Server) Serve() {
 	srv.mu.Lock()
-	srv.cm = NewConsensusModule(srv.serverId, srv.peerIds, srv, srv.ready)
+	srv.cm = NewConsensusModule(srv.serverId, srv.peerIds, srv, srv.ready, srv.commitChan)
 
 	// Create a new RPC server and register a RPCProxy that forwards
 	// all method to srv.cm
@@ -120,6 +123,8 @@ func (srv *Server) GetListenAddr() net.Addr {
 	return srv.listener.Addr()
 }
 
+// ConnectToPeer connects this server to the peer identified by the (addr) param.
+// The connected client (peer) is saved to the Server for continued operation.
 func (srv *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
@@ -133,6 +138,8 @@ func (srv *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 	return nil
 }
 
+// DisconnectPeer disconnects this server from the peer identified by the peerId.
+// The connected (now disconnected) client is removed from the Server.
 func (srv *Server) DisconnectPeer(peerId int) error {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
