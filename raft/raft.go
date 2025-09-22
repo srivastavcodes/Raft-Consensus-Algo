@@ -175,6 +175,7 @@ func (cm *ConsensusModule) Stop() {
 	defer cm.mu.Unlock()
 	cm.state = StateDead
 	cm.dlogf("[%d] becomes dead", cm.id)
+	close(cm.newCommitReadyChan)
 }
 
 // dlogf logs a debugging message if DebugCM > 0
@@ -300,7 +301,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				newEntriesIndex = 0
 			)
 			for {
-				if logInsertIndex > len(cm.log) || newEntriesIndex >= len(args.Entries) {
+				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
 					break
 				}
 				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
@@ -469,7 +470,7 @@ func (cm *ConsensusModule) startElection() {
 				}
 				if reply.Term == savedCurrentTerm {
 					if reply.VoteGranted {
-						votesReceived++
+						votesReceived += 1
 						if votesReceived*2 > len(cm.peerIds)+1 {
 							// Won the election!
 							cm.dlogf("wins the election with %d votes", votesReceived)
@@ -494,6 +495,14 @@ func (cm *ConsensusModule) startElection() {
 func (cm *ConsensusModule) startLeader() {
 	cm.state = StateLeader
 	cm.dlogf("becomes StateLeader; term=%d, log=%v", cm.currentTerm, cm.log)
+
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = -1
+	}
+	cm.dlogf("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
+		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
+	)
 	go func() {
 		ticker := time.Tick(50 * time.Millisecond)
 		// Send periodic heartbeats, as long as still leader.
@@ -515,6 +524,10 @@ func (cm *ConsensusModule) startLeader() {
 // replies and adjusts ConsensusModule state
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
+	if cm.state != StateLeader {
+		cm.mu.Unlock()
+		return
+	}
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
