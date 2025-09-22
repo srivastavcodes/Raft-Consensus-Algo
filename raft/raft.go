@@ -126,7 +126,7 @@ type ConsensusModule struct {
 	matchIndex map[int]int
 }
 
-// NewConsensusModule creates a new ConsensusModule with the given ID, list of peerIds and server.
+// NewConsensusModule creates a new ConsensusModule with the given ID, list of peerIds, and server.
 // The ready channel signals the ConsensusModule that all peers are connected, and it's safe to
 // start its state machine.
 func NewConsensusModule(id int, peerIds []int, server *Server,
@@ -175,17 +175,22 @@ func NewConsensusModule(id int, peerIds []int, server *Server,
 // It returns true if this ConsensusModule is the leader - in which case the command
 // is accepted. If false is returned, the client will have to find a different
 // ConsensusModule to submit this command to.
-func (cm *ConsensusModule) Submit(command any) bool {
+func (cm *ConsensusModule) Submit(command any) int {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	cm.dlogf("Submit received by %v: %v", cm.state, command)
-
 	if cm.state == StateLeader {
+		submitIndex := len(cm.log)
+
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.persistToStorage()
+
 		cm.dlogf("log=%v", cm.log)
-		return true
+		cm.mu.Unlock()
+		cm.triggerAEChan <- struct{}{}
+		return submitIndex
 	}
-	return false
+	cm.mu.Unlock()
+	return -1
 }
 
 // dlogf logs a debugging message if DebugCM > 0
@@ -399,7 +404,7 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	}
 }
 
-func (cm *ConsensusModule) persisToStorage() {
+func (cm *ConsensusModule) persistToStorage() {
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
 		log.Fatalf("failed to encode currentTerm. err=%v", err)
@@ -537,7 +542,6 @@ func (cm *ConsensusModule) startElection() {
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = StateLeader
-	cm.dlogf("becomes StateLeader; term=%d, log=%v", cm.currentTerm, cm.log)
 
 	for _, peerId := range cm.peerIds {
 		cm.nextIndex[peerId] = len(cm.log)
@@ -546,26 +550,50 @@ func (cm *ConsensusModule) startLeader() {
 	cm.dlogf("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
 	)
-	go func() {
-		ticker := time.Tick(50 * time.Millisecond)
-		// Send periodic heartbeats, as long as still leader.
+	// This goroutine runs in the background and sends AEs to peers:
+	// - Whenever something is sent on triggerAEChan.
+	// - Ever 50ms, if no events occur on triggerAEChan.
+	go func(heartbeatTimeout time.Duration) {
+		// Immediately send AEs to peers.
+		cm.leaderSendAEs()
+		timer := time.NewTimer(heartbeatTimeout)
 		for {
-			cm.leaderSendHeartbeats()
-			<-ticker
-
-			cm.mu.Lock()
-			if cm.state != StateLeader {
-				cm.mu.Unlock()
-				return
+			var doSend bool
+			select {
+			case <-timer.C:
+				doSend = true
+				// reset the timer to fire again after heartbeatTimeout.
+				timer.Stop()
+				timer.Reset(heartbeatTimeout)
+			case _, ok := <-cm.triggerAEChan:
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+				// reset timer for heartbeat timeout.
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(heartbeatTimeout)
 			}
-			cm.mu.Unlock()
+			if doSend {
+				// If this isn't a leader anymore, stop the heartbeat.
+				cm.mu.Lock()
+				if cm.state != StateLeader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAEs()
+			}
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
 // leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
-// replies and adjusts ConsensusModule state
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+// replies, and adjusts ConsensusModule state
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	if cm.state != StateLeader {
 		cm.mu.Unlock()
@@ -637,7 +665,11 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 						}
 						if cm.commitIndex != savedCommitIndex {
 							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
+							// commitIndex changed: the leader considers new entries to be
+							// committed. Send new entries on the commit channel to this
+							// leader's clients and notify followers by sending them AEs.
 							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{}
 						}
 					} else {
 						cm.nextIndex[peerId] = ni - 1
