@@ -529,7 +529,8 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			if prevLogIndex >= 0 {
 				prevLogTerm = cm.log[prevLogIndex].Term
 			}
-			// entries that need to be commited, found after the next index.
+			// entries that need to be commited (from this leader's log), will be after ni
+			// because till the ni, the peer will also have the same logs as this leader.
 			// eg: ((3..4)...9), ni = 5, [ni:] = (5..9) -> newly commited.
 			entries := cm.log[ni:]
 
