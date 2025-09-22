@@ -172,9 +172,8 @@ func NewConsensusModule(id int, peerIds []int, server *Server,
 // client read the commit channel passed in the constructor to be notified of new
 // committed entries.
 //
-// It returns true if this ConsensusModule is the leader - in which case the command
-// is accepted. If false is returned, the client will have to find a different
-// ConsensusModule to submit this command to.
+// If this ConsensusModule is the leader, Submit returns the log index where the command
+// is submitted. Otherwise, it returns -1.
 func (cm *ConsensusModule) Submit(command any) int {
 	cm.mu.Lock()
 	cm.dlogf("Submit received by %v: %v", cm.state, command)
@@ -186,6 +185,7 @@ func (cm *ConsensusModule) Submit(command any) int {
 
 		cm.dlogf("log=%v", cm.log)
 		cm.mu.Unlock()
+
 		cm.triggerAEChan <- struct{}{}
 		return submitIndex
 	}
@@ -243,7 +243,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		cm.electionResetEvent = time.Now()
 	}
 	reply.Term = cm.currentTerm
-
+	cm.persistToStorage()
 	cm.dlogf("RequestVote reply: %+v", reply)
 	return nil
 }
@@ -260,6 +260,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Faster conflict resolution optimization (described near the end of section
+	// 5.3 in the paper.)
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 /*
@@ -343,9 +348,29 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.dlogf("setting commitIndex=%d", cm.commitIndex)
 				cm.newCommitReadyChan <- struct{}{}
 			}
+		} else {
+			// No match for PrevLogIndex/PrevLogTerm. Populate ConflictIndex/ConflictTerm
+			// to help the leader bring us up to date quickly.
+			if len(cm.log) <= args.PrevLogIndex {
+				reply.ConflictIndex = len(cm.log)
+				reply.ConflictTerm = -1
+			} else {
+				// PrevLogIndex points within our log, but PrevLogTerm doesn't match
+				// cm.log[PrevLogIndex].Term.
+				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+
+				var i int
+				for i = args.PrevLogIndex - 1; i >= 0; i-- {
+					if cm.log[i].Term != reply.ConflictTerm {
+						break
+					}
+				}
+				reply.ConflictIndex = i + 1
+			}
 		}
 	}
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlogf("AppendEntries reply: %+v", reply)
 	return nil
 }
@@ -556,6 +581,7 @@ func (cm *ConsensusModule) startLeader() {
 	go func(heartbeatTimeout time.Duration) {
 		// Immediately send AEs to peers.
 		cm.leaderSendAEs()
+
 		timer := time.NewTimer(heartbeatTimeout)
 		for {
 			var doSend bool
@@ -632,22 +658,22 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Unlock()
-
+				// Unfortunately, we cannot just defer mu.Unlock() here, because one
+				// of the conditional paths needs to send on some channels. So we
+				// have to carefully place mu.Unlock() on all exit paths from this
+				// point on.
 				if reply.Term > savedCurrentTerm {
 					cm.dlogf("greater term in heartbeat reply")
 					cm.becomeFollower(reply.Term)
+					cm.mu.Unlock()
 					return
 				}
 				if cm.state == StateLeader && savedCurrentTerm == reply.Term {
 					if reply.Success {
 						cm.nextIndex[peerId] = ni + len(entries)
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
-						cm.dlogf("AppendEntries reply from %d success: nextIndex := %+v, matchIndex := %+v",
-							peerId, cm.nextIndex, cm.matchIndex,
-						)
-						savedCommitIndex := cm.commitIndex
 
+						savedCommitIndex := cm.commitIndex
 						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
 							if cm.log[i].Term == cm.currentTerm {
 								matchCount := 1
@@ -663,18 +689,43 @@ func (cm *ConsensusModule) leaderSendAEs() {
 								}
 							}
 						}
+						cm.dlogf("AppendEntries reply from %d success: nextIndex := %+v, matchIndex := %+v",
+							peerId, cm.nextIndex, cm.matchIndex,
+						)
 						if cm.commitIndex != savedCommitIndex {
 							cm.dlogf("leader sets commitIndex := %d", cm.commitIndex)
 							// commitIndex changed: the leader considers new entries to be
 							// committed. Send new entries on the commit channel to this
 							// leader's clients and notify followers by sending them AEs.
+							cm.mu.Unlock()
 							cm.newCommitReadyChan <- struct{}{}
 							cm.triggerAEChan <- struct{}{}
+						} else {
+							cm.mu.Unlock()
 						}
 					} else {
-						cm.nextIndex[peerId] = ni - 1
+						if reply.ConflictTerm >= 0 {
+							lastIndexOfTerm := -1
+
+							for i := len(cm.log) - 1; i >= 0; i-- {
+								if cm.log[i].Term == reply.ConflictTerm {
+									lastIndexOfTerm = i
+									break
+								}
+							}
+							if lastIndexOfTerm >= 0 {
+								cm.nextIndex[peerId] = lastIndexOfTerm + 1
+							} else {
+								cm.nextIndex[peerId] = reply.ConflictIndex
+							}
+						} else {
+							cm.nextIndex[peerId] = reply.ConflictIndex
+						}
 						cm.dlogf("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+						cm.mu.Unlock()
 					}
+				} else {
+					cm.mu.Unlock()
 				}
 			}
 		}()
@@ -689,13 +740,15 @@ func (cm *ConsensusModule) leaderSendAEs() {
 // buffered and will limit how fast the client consumes new committed entries.
 // Returns when newCommitReadyChan is closed.
 func (cm *ConsensusModule) commitChanSender() {
+	defer cm.newCommitReadyChanWg.Done()
+
 	for range cm.newCommitReadyChan {
 		// find which entries we have to apply
 		cm.mu.Lock()
-
-		savedTerm := cm.currentTerm
-		savedLastApplied := cm.lastApplied
-
+		var (
+			savedTerm        = cm.currentTerm
+			savedLastApplied = cm.lastApplied
+		)
 		var entries []LogEntry
 		if cm.commitIndex > cm.lastApplied {
 			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
@@ -705,6 +758,7 @@ func (cm *ConsensusModule) commitChanSender() {
 		cm.dlogf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
 
 		for i, entry := range entries {
+			cm.dlogf("send on commitChan i=%v, entry=%v", i, entry)
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,
 				Term:    savedTerm,
@@ -766,9 +820,16 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 // quickly, but it may take a bit of time (up to ~electionTimeout) for all
 // goroutines to exit
 func (cm *ConsensusModule) Stop() {
+	cm.dlogf("CM.Stop called")
+
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	cm.state = StateDead
+	cm.mu.Unlock()
+
 	cm.dlogf("[%d] becomes dead", cm.id)
+
+	// close the commit notification channel and wait for the goroutine that
+	// monitors it to exit.
 	close(cm.newCommitReadyChan)
+	cm.newCommitReadyChanWg.Wait()
 }

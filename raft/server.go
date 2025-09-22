@@ -23,26 +23,31 @@ import (
 // Peer communication and doesn't have to worry about the specifics of
 // running an RPC server.
 type Server struct {
-	mu          sync.Mutex
-	serverId    int
-	peerIds     []int
-	cm          *ConsensusModule
-	rpcProxy    *RPCProxy
-	rpcServer   *rpc.Server
-	listener    net.Listener
+	mu       sync.Mutex
+	serverId int
+	peerIds  []int
+	cm       *ConsensusModule
+	storage  Storage
+
+	rpcServer *rpc.Server
+	rpcProxy  *RPCProxy
+	listener  net.Listener
+
 	commitChan  chan<- CommitEntry
 	peerClients map[int]*rpc.Client
-	ready       <-chan any
-	quitch      chan struct{}
-	wg          sync.WaitGroup
+
+	ready  <-chan any
+	quitch chan struct{}
+	wg     sync.WaitGroup
 }
 
-func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- CommitEntry) *Server {
+func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
 	return &Server{
 		serverId: serverId,
 
 		peerIds:     peerIds,
 		peerClients: make(map[int]*rpc.Client),
+		storage:     storage,
 
 		ready:      ready,
 		commitChan: commitChan,
@@ -58,7 +63,7 @@ func NewServer(serverId int, peerIds []int, ready <-chan any, commitChan chan<- 
 
 func (srv *Server) Serve() {
 	srv.mu.Lock()
-	srv.cm = NewConsensusModule(srv.serverId, srv.peerIds, srv, srv.ready, srv.commitChan)
+	srv.cm = NewConsensusModule(srv.serverId, srv.peerIds, srv, srv.storage, srv.ready, srv.commitChan)
 
 	// Create a new RPC server and register a RPCProxy that forwards
 	// all method to srv.cm
@@ -94,6 +99,11 @@ func (srv *Server) Serve() {
 			}()
 		}
 	}()
+}
+
+// Submit wraps the underlying ConsensusModule's Submit; see that method for doc.
+func (srv *Server) Submit(cmd any) int {
+	return srv.cm.Submit(cmd)
 }
 
 // DisconnectAll closes all the client connections to peers for this server.
@@ -167,13 +177,39 @@ func (srv *Server) Call(id int, serviceMethod string, args any, reply any) error
 	}
 }
 
+// IsLeader checks if Server thinks it's the leader in the Raft cluster.
+func (srv *Server) IsLeader() bool {
+	_, _, isLeader := srv.cm.Report()
+	return isLeader
+}
+
+// Proxy provides access to the RPC proxy this server is using; this is only
+// for testing purposes to simulate faults.
+func (srv *Server) Proxy() *RPCProxy {
+	return srv.rpcProxy
+}
+
 // RPCProxy is a trivial pass-thru proxy type for ConsensusModule's RPC methods.
 // It's useful for:
 //   - Simulating a small delay in RPC transmission.
 //   - Simulating possible unreliable connections by delaying some messages
 //     significantly and dropping others when RAFT_UNRELIABLE_RPC is set.
 type RPCProxy struct {
+	mu sync.Mutex
 	cm *ConsensusModule
+
+	// numCallsBeforeDrop is used to control dropping RPC calls:
+	//   -1: means we're not dropping any calls
+	//    0: means we're dropping all calls now
+	//   >0: means we'll start dropping calls after this number is made
+	numCallsBeforeDrop int
+}
+
+func NewProxy(cm *ConsensusModule) *RPCProxy {
+	return &RPCProxy{
+		cm:                 cm,
+		numCallsBeforeDrop: -1,
+	}
 }
 
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
@@ -206,4 +242,35 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.AppendEntries(args, reply)
+}
+
+func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args any, reply any) error {
+	rpp.mu.Lock()
+	if rpp.numCallsBeforeDrop == 0 {
+		rpp.mu.Unlock()
+		rpp.cm.dlogf("drop Call %s: %v", method, args)
+		return fmt.Errorf("RPC failed")
+	} else {
+		if rpp.numCallsBeforeDrop > 0 {
+			rpp.numCallsBeforeDrop--
+		}
+		rpp.mu.Unlock()
+		return peer.Call(method, args, reply)
+	}
+}
+
+// DropCallsAfterN instruct the proxy to drop calls after n are made from this
+// point.
+func (rpp *RPCProxy) DropCallsAfterN(n int) {
+	rpp.mu.Lock()
+	defer rpp.mu.Unlock()
+
+	rpp.numCallsBeforeDrop = n
+}
+
+func (rpp *RPCProxy) DontDropCalls() {
+	rpp.mu.Lock()
+	defer rpp.mu.Unlock()
+
+	rpp.numCallsBeforeDrop = -1
 }
