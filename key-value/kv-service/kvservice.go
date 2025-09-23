@@ -1,0 +1,261 @@
+package kv_service
+
+import (
+	"context"
+	"encoding/gob"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"raft/key-value/api"
+	"raft/raft"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/joho/godotenv"
+)
+
+var (
+	_          = godotenv.Load(".envrc")
+	DebugKv, _ = strconv.Atoi(os.Getenv("DebugKv"))
+)
+
+type KVService struct {
+	mu sync.Mutex
+
+	// id is the service ID in a raft cluster.
+	id int
+
+	// rs is a raft server that contain a ConsensusModule.
+	rs *raft.Server
+
+	// commitChan is the commit channel passed to the raft server; when commands
+	// are committed, they're sent on this channel.
+	commitChan chan raft.CommitEntry
+
+	// commitSubs are the commit subscriptions currently active in this service.
+	// See the createCommitSubscription method for more details.
+	commitSubs map[int]chan Command
+
+	// ds is the underlying data store implementing the KV DB.
+	ds *DataStore
+
+	// srv is the HTTP server exposed by the service to the external world.
+	srv *http.Server
+
+	// httpResponseEnabled controls whether this service returns HTTP responses
+	// to the client. It's only used for testing and debugging.
+	httpResponseEnabled bool
+}
+
+// NewService creates a new KVService
+//   - id: this service's ID within its Raft cluster
+//   - peerIds: the IDs of the other Raft peers in the cluster
+//   - storage: a raft.Storage implementation the service can use for durable
+//     storage to persist its state.
+//   - readyChan: notification channel that has to be closed when the Raft
+//     cluster is ready (all peers are up and connected to each other).
+func NewService(id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVService {
+	gob.Register(Command{})
+	commitChan := make(chan raft.CommitEntry)
+
+	// raft.Server handles the raft rpcs in the cluster; after Serve is called,
+	// it's ready to accept rpc connections from peers.
+	rs := raft.NewServer(id, peerIds, storage, readyChan, commitChan)
+	rs.Serve()
+	kvs := &KVService{
+		id:                  id,
+		rs:                  rs,
+		commitChan:          commitChan,
+		commitSubs:          make(map[int]chan Command),
+		ds:                  NewDataStore(),
+		httpResponseEnabled: true,
+	}
+	// kvs.runUpdater()
+	return kvs
+}
+
+// IsLeader checks if kvs thinks it's the leader in the Raft cluster. Only
+// use this for testing and debugging.
+func (kvs *KVService) IsLeader() bool {
+	return kvs.rs.IsLeader()
+}
+
+func (kvs *KVService) ServeHTTP(port int) {
+	if kvs.srv != nil {
+		panic("ServeHTTP called with existing server")
+	}
+	mux := http.NewServeMux()
+	// mux.HandleFunc("POST /get/", kvs.handleGet)
+	// mux.HandleFunc("POST /put/", kvs.handlePut)
+	// mux.HandleFunc("POST /cas/", kvs.handleCAS)
+	kvs.srv = &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+	}
+	go func() {
+		kvs.kvlogf("serving HTTP on %s", kvs.srv.Addr)
+		if err := kvs.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal("FATALITY! server panicked", err)
+		}
+		kvs.srv = nil
+	}()
+}
+
+func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
+	pr := &api.PutRequest{}
+	if err := readRequestJSON(req, pr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlogf("HTTP Put %v", pr)
+
+	// Submit a command into the raft server; this is the state change in the
+	// replicated state machine built on top of the raft log.
+	cmd := Command{
+		Kind:  CommandPut,
+		Key:   pr.Key,
+		Value: pr.Value,
+		Id:    kvs.id,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	// If we're not the raft leader, send an appropriate status.
+	if logIndex < 0 {
+		renderJSON(w, api.PutResponse{ResponseStatus: api.StatusNotLeader})
+		return
+	}
+
+	// Subscribe for a commit update for our log index. Then wait for it to be
+	// delivered.
+	sub := kvs.createCommitSubscription(logIndex)
+
+	// Wait on the sub channel: the updater will deliver a value when the raft
+	// log has a commit at logIndex. To ensure a clean shutdown of the service,
+	// also select on the request context - if the request is canceled, this
+	// handler aborts without sending data back to the client.
+	select {
+	case commitCmd := <-sub:
+		// If this is our command, then all is good! If it's some other server's
+		// command, this means we lost leadership at some point and should
+		// return an error.
+		if commitCmd.Id == kvs.id {
+			renderJSON(w, api.PutResponse{
+				ResponseStatus: api.StatusOK,
+				KeyFound:       commitCmd.ResultFound,
+				PrevValue:      commitCmd.ResultValue,
+			})
+		} else {
+			renderJSON(w, api.PutResponse{
+				ResponseStatus: api.StatusFailedCommit,
+			})
+		}
+	case <-req.Context().Done():
+		return
+	}
+}
+
+// createCommitSubscription creates a "commit subscription" for a certain log
+// index. It's used by client request handlers that submit a command to the
+// raft CM. createCommitSubscription(index) means "I want to be notified when
+// an entry is committed at this index in the raft log". The entry is delivered
+// on the returned(buffered) channel by the updater goroutine, after which the
+// channel is closed and the subscription is automatically canceled.
+func (kvs *KVService) createCommitSubscription(logIndex int) chan Command {
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+
+	if _, ok := kvs.commitSubs[logIndex]; ok {
+		panic(fmt.Errorf("duplicate commit subscription for logIndex=%d", logIndex))
+	}
+	ch := make(chan Command, 1)
+	kvs.commitSubs[logIndex] = ch
+	return ch
+}
+
+func (kvs *KVService) popCommitSubscription(logIndex int) chan Command {
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+	ch := kvs.commitSubs[logIndex]
+	defer delete(kvs.commitSubs, logIndex)
+	return ch
+}
+
+// runUpdater runs the "updater" goroutine that reads the commit channel
+// from Raft and updates the data store; this is the Replicated State-Machine
+// part of distributed consensus!
+// It also notifies subscribers (registered with createCommitSubscription).
+func (kvs *KVService) runUpdater() {
+	go func() {
+		for entry := range kvs.commitChan {
+			cmd := entry.Command.(Command)
+			switch cmd.Kind {
+			case CommandPut:
+				cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
+			case CommandGet:
+				cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
+			case CommandCAS:
+				cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
+			default:
+				panic(fmt.Errorf("unexpected command %v", cmd))
+			}
+			// Forward this entry to the subscriber interested in its index, and
+			// close the subscription - it's single-use.
+			if sub := kvs.popCommitSubscription(entry.Index); sub != nil {
+				sub <- cmd
+				close(sub)
+			}
+		}
+	}()
+}
+
+// Shutdown performs a proper shutdown of the service: shuts down the Raft RPC
+// server, and shuts down the main HTTP service. It only returns once shutdown
+// is complete.
+// Note: DisconnectFromRaftPeers on all peers in the cluster should be done
+// before Shutdown is called.
+func (kvs *KVService) Shutdown() error {
+	kvs.kvlogf("shutting down raft server")
+	kvs.rs.Shutdown()
+
+	kvs.kvlogf("closing commitChan")
+	close(kvs.commitChan)
+	if kvs.srv != nil {
+		kvs.kvlogf("shutting down HTTP server")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		_ = kvs.srv.Shutdown(ctx)
+		kvs.kvlogf("HTTP shutdown complete")
+		return nil
+	}
+	return nil
+}
+
+func (kvs *KVService) kvlogf(format string, args ...any) {
+	if DebugKv > 0 {
+		format = fmt.Sprintf("[kv %d] ", kvs.id) + format
+		log.Printf(format, args)
+	}
+}
+
+// The following functions exist for testing purposes, to simulate faults.
+
+func (kvs *KVService) ConnectToRaftPeer(peerId int, addr net.Addr) error {
+	return kvs.rs.ConnectToPeer(peerId, addr)
+}
+
+func (kvs *KVService) GetRaftListenAddr() net.Addr {
+	return kvs.rs.GetListenAddr()
+}
+
+func (kvs *KVService) DisconnectFromAllRaftPeers() {
+	kvs.rs.DisconnectAll()
+}
+
+func (kvs *KVService) DisconnectFromRaftPeer(peerId int) error {
+	return kvs.rs.DisconnectPeer(peerId)
+}

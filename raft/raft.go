@@ -50,10 +50,10 @@ const (
 
 func (state CMState) String() string {
 	switch state {
-	case Leader:
-		return "Leader"
 	case Candidate:
 		return "Candidate"
+	case Leader:
+		return "Leader"
 	case Follower:
 		return "Follower"
 	case StateDead:
