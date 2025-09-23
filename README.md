@@ -31,25 +31,6 @@ Raft is a consensus algorithm designed to be more understandable than Paxos whil
 - **RequestVote**: Used during leader election to gather votes
 - **AppendEntries**: Used for log replication and leader heartbeats
 
-## Architecture
-
-The implementation follows the Raft paper specification:
-
-- **Consensus Module**: Handles leader election, log replication, and ensures safety properties
-- **Persistent State**: Current term, voted for candidate, and log entries (survives crashes)
-- **Volatile State**: Commit index and last applied index on all servers
-- **Leader State**: Next index and match index for each follower (leader only)
-
-## What This Implementation Covers
-
-This project implements the complete Raft algorithm across multiple progressive parts:
-
-1. **Elections**: Leader election mechanism with randomized timeouts
-2. **Commands and Log Replication**: Handling client commands and replicating them across the cluster
-3. **Persistence and Optimizations**: Making state persist across crashes with performance improvements
-4. **Key/Value Database**: A practical application demonstrating Raft in action
-5. **Exactly-Once Delivery**: Ensuring client requests are processed exactly once
-
 ## Getting Started
 
 ### Prerequisites
@@ -60,8 +41,8 @@ This project implements the complete Raft algorithm across multiple progressive 
 ### Installation
 
 ```bash
-git clone <repository-url>
-cd raft-implementation
+git clone github.com/srivastavcodes/raft-consensus-algo-impl
+cd raft-consensus-algo-impl
 go build ./...
 ```
 
@@ -91,41 +72,6 @@ go test ./...
 go test ./raft     # Core Raft algorithm tests
 go test ./kvdb     # Key/Value database tests
 ```
-
-## Design Philosophy
-
-This implementation prioritizes:
-
-- **Educational Value**: Code is written to be clear and understandable
-- **Correctness**: Rigorous testing ensures the implementation handles edge cases
-- **Simplicity**: Uses Go's built-in concurrency primitives and standard library
-- **Consistency over Availability**: Follows CP in CAP theorem - prioritizes consistency
-
-## Fault Tolerance
-
-The system handles various failure scenarios:
-
-- Server crashes and restarts (with persistent state recovery)
-- Network partitions (requires majority to make progress)
-- Message loss and reordering
-- Leader failures (automatic re-election)
-
-A cluster with N servers can tolerate (N-1)/2 failures while maintaining availability.
-
-## Performance Characteristics
-
-This implementation is designed for:
-- **Low-throughput, high-consistency scenarios** (configuration management, leader election, etc.)
-- **Coarse-grained operations** rather than fine-grained database transactions
-- **Strong consistency guarantees** at the expense of some availability during partitions
-
-## Implementation Notes
-
-- Uses Go's `net/rpc` for simple inter-server communication
-- Leverages Go's goroutines and channels for concurrent operations
-- Persistent state is handled through simple file-based storage
-- Designed for educational purposes with clear separation of concerns
-
 ## References
 
 - [Raft Paper](https://raft.github.io/raft.pdf) - "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout
