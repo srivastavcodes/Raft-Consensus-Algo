@@ -42,20 +42,20 @@ type CommitEntry struct {
 type CMState int
 
 const (
-	StateFollower CMState = iota
-	StateCandidate
-	StateLeader
+	Follower CMState = iota
+	Candidate
+	Leader
 	StateDead
 )
 
 func (state CMState) String() string {
 	switch state {
-	case StateFollower:
-		return "Follower"
-	case StateCandidate:
-		return "Candidate"
-	case StateLeader:
+	case Leader:
 		return "Leader"
+	case Candidate:
+		return "Candidate"
+	case Follower:
+		return "Follower"
 	case StateDead:
 		return "Dead"
 	default:
@@ -138,7 +138,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server,
 
 		server:  server,
 		storage: storage,
-		state:   StateFollower,
+		state:   Follower,
 
 		votedFor:    -1,
 		commitIndex: -1,
@@ -177,7 +177,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server,
 func (cm *ConsensusModule) Submit(command any) int {
 	cm.mu.Lock()
 	cm.dlogf("Submit received by %v: %v", cm.state, command)
-	if cm.state == StateLeader {
+	if cm.state == Leader {
 		submitIndex := len(cm.log)
 
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
@@ -283,7 +283,7 @@ Total of two RPC calls to commit a new command:
 */
 
 // AppendEntries handles AppendEntry RPCs from leaders for log replication and heartbeats.
-// Updates term if higher, transitions to StateFollower if needed, and resets election timer.
+// Updates term if higher, transitions to Follower if needed, and resets election timer.
 // Returns success only if term matches current term.
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
@@ -301,7 +301,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	reply.Success = false
 
 	if args.Term == cm.currentTerm {
-		if cm.state != StateFollower {
+		if cm.state != Follower {
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
@@ -380,20 +380,20 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	peer finds itself as anything other than a follower during AppendEntry rpc
 	from a legitimate leader, it's forced to become a follower.
 
-	if cm.state != StateFollower {
+	if cm.state != Follower {
 		cm.becomeFollower(args.Term)
 	}
-	- StateCandidate → StateFollower: If this server is currently a StateCandidate running an
+	- Candidate → Follower: If this server is currently a Candidate running an
 	election, but receives a valid AppendEntries from a legitimate leader,
 	it should abandon its candidacy and become a follower of the established
 	leader.
 
-	- StateLeader → StateFollower: If this server thinks it's a StateLeader but receives a
+	- Leader → Follower: If this server thinks it's a Leader but receives a
 	valid AppendEntries from another server with the same term, it means
 	there's another legitimate leader (split-brain scenario). It should step down
 	and become a follower.
 
-	- Already StateFollower: If it's already a StateFollower, the condition is false and
+	- Already Follower: If it's already a Follower, the condition is false and
 	no state change occurs, which is correct.
 */
 
@@ -473,7 +473,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		cm.mu.Lock()
 		// here we will return if this peer becomes the leader
-		if cm.state != StateCandidate && cm.state != StateFollower {
+		if cm.state != Candidate && cm.state != Follower {
 			cm.dlogf("in election timer, state=%d, bailing out", cm.state)
 			cm.mu.Unlock()
 			return
@@ -505,14 +505,14 @@ Things we need to run an election:
 // startElection starts a new election with this ConsensusModule as a candidate.
 // Expects cm.mu to be locked
 func (cm *ConsensusModule) startElection() {
-	cm.state = StateCandidate
+	cm.state = Candidate
 	cm.currentTerm += 1
 
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 
 	cm.votedFor = cm.id
-	cm.dlogf("becomes StateCandidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+	cm.dlogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
 	votesReceived := 1
 
@@ -537,7 +537,7 @@ func (cm *ConsensusModule) startElection() {
 				defer cm.mu.Unlock()
 				cm.dlogf("received RequestVoteReply %+v", reply)
 
-				if cm.state != StateCandidate {
+				if cm.state != Candidate {
 					cm.dlogf("while waiting for reply, state=%v", cm.state)
 					return
 				}
@@ -566,7 +566,7 @@ func (cm *ConsensusModule) startElection() {
 // startLeader switches ConsensusModule into a leader state and begins the process of heartbeats.
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) startLeader() {
-	cm.state = StateLeader
+	cm.state = Leader
 
 	for _, peerId := range cm.peerIds {
 		cm.nextIndex[peerId] = len(cm.log)
@@ -606,7 +606,7 @@ func (cm *ConsensusModule) startLeader() {
 			if doSend {
 				// If this isn't a leader anymore, stop the heartbeat.
 				cm.mu.Lock()
-				if cm.state != StateLeader {
+				if cm.state != Leader {
 					cm.mu.Unlock()
 					return
 				}
@@ -621,7 +621,7 @@ func (cm *ConsensusModule) startLeader() {
 // replies, and adjusts ConsensusModule state
 func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
-	if cm.state != StateLeader {
+	if cm.state != Leader {
 		cm.mu.Unlock()
 		return
 	}
@@ -668,7 +668,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 					cm.mu.Unlock()
 					return
 				}
-				if cm.state == StateLeader && savedCurrentTerm == reply.Term {
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
 					if reply.Success {
 						cm.nextIndex[peerId] = ni + len(entries)
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
@@ -771,13 +771,13 @@ func (cm *ConsensusModule) commitChanSender() {
 	cm.dlogf("commitChanSender done")
 }
 
-// becomeFollower transitions the ConsensusModule to StateFollower state with the given term.
+// becomeFollower transitions the ConsensusModule to Follower state with the given term.
 // Resets voting state, updates election timer, and starts a new election
 // timer.
 // Expects cm.mu to be locked.
 func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.dlogf("becomes StateFollower with term=%d; log=%v", term, cm.log)
-	cm.state = StateFollower
+	cm.dlogf("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.state = Follower
 	cm.currentTerm = term
 	cm.votedFor = -1
 	cm.electionResetEvent = time.Now()
@@ -813,7 +813,7 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == StateLeader
+	return cm.id, cm.currentTerm, cm.state == Leader
 }
 
 // Stop stops this ConsensusModule, cleaning up its state. This method returns
