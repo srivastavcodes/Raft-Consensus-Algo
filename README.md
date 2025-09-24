@@ -1,6 +1,9 @@
 # Raft Consensus Algorithm Implementation
 
-A complete implementation of the Raft distributed consensus algorithm in Go, designed for educational purposes and practical understanding of how distributed consensus works in real systems.
+A complete implementation of the Raft distributed consensus algorithm in Go, built for educational purposes (mostly for myself) 
+and 
+practical 
+understanding of how distributed consensus works in real systems.
 
 ## Overview
 
@@ -50,12 +53,23 @@ go build ./...
 
 The implementation uses Go's `net/rpc` for inter-server communication. Each part can be tested independently using the provided test suite.
 
+### Example Test Run
+
+![raft-leader-election](example-1.png)
+
+*Demonstration of the core functionality of **Raft's** leader election*
+
+![basic-put/get-operations](example-2.png)
+
+*storing and retrieving data in a 3-node Raft cluster*
+
 ### Key/Value Database Example
 
 The implementation includes a complete key/value database built on Raft:
 
+- **PUT key value**: Store a key-value pair
+- **APPEND value on key**: Append value to a pre-existing key - create if not exist.
 - **GET key**: Retrieve a value for a key
-- **SET key value**: Store a key-value pair  
 - **CAS key old_value new_value**: Compare-and-swap operation
 
 Clients connect to any server in the cluster, and the system automatically handles routing to the leader.
@@ -65,18 +79,19 @@ Clients connect to any server in the cluster, and the system automatically handl
 The implementation includes comprehensive tests for each component:
 
 ```bash
-# Run all tests
-go test ./...
+# Run tests on each component at once
+go test           # Test the entire system
 
 # Test specific components
-go test ./raft     # Core Raft algorithm tests
-go test ./kvdb     # Key/Value database tests
+go test raft/     # Core Raft algorithm tests
 ```
 ## References
 
-- [Raft Paper](https://raft.github.io/raft.pdf) - "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John Ousterhout
-- [Raft Website](https://raft.github.io/) - Interactive visualizations and additional resources
-- [Diego Ongaro's PhD Dissertation](https://github.com/ongardie/dissertation) - Comprehensive treatment of Raft
+- [Raft Paper](https://raft.github.io/raft.pdf) - "In Search of an Understandable Consensus Algorithm" by Diego Ongaro and John 
+  Ousterhout.
+- [Raft Website](https://raft.github.io/) - Interactive visualizations and additional resources.
+- [The Green Place](https://eli.thegreenplace.net/) - Comprehensive guide to building the Raft algorithm.
+- [Diego Ongaro's PhD Dissertation](https://github.com/ongardie/dissertation) - Comprehensive treatment of Raft.
 
 ## License
 
