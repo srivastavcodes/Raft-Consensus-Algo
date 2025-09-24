@@ -1,9 +1,6 @@
 # Raft Consensus Algorithm Implementation
 
-A complete implementation of the Raft distributed consensus algorithm in Go, built for educational purposes (mostly for myself) 
-and 
-practical 
-understanding of how distributed consensus works in real systems.
+A complete implementation of the Raft consensus algorithm in Go, built for educational purposes and practical understanding of how distributed consensus works in real systems.
 
 ## Overview
 
