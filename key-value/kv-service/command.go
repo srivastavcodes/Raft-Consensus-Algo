@@ -32,14 +32,25 @@ package kv_service
 // * ResultFound is true if Key was previously found in the store
 // * ResultValue is the old value of Key, if it was previously found
 type Command struct {
-	Kind         CommandKind
-	Key, Value   string
-	CompareValue string
+	CmdKind      CommandKind
+	Key          string
+	Value        string
 	ResultValue  string
-	ResultFound  bool
+	CompareValue string
 
-	// Id is the raft ID of the server submitting this command.
-	Id int
+	ResultFound bool
+
+	// ServiceID is the raft ID of the server submitting this command.
+	ServiceID int
+
+	// ClientID and RequestID uniquely identify the request+client.
+	ClientID, RequestID int64
+
+	// IsDuplicate is used to mark the command as a duplicate by the updater.
+	// When the updater notices a command that has a client+request ID that
+	// has already been executed, the command is not applied to the datastore;
+	// instead, IsDuplicate is set to true.
+	IsDuplicate bool
 }
 
 type CommandKind int
@@ -48,6 +59,7 @@ const (
 	CommandInvalid CommandKind = iota
 	CommandGet
 	CommandPut
+	CommandAppend
 	CommandCAS
 )
 
@@ -55,6 +67,7 @@ var commandName = map[CommandKind]string{
 	CommandInvalid: "invalid",
 	CommandGet:     "get",
 	CommandPut:     "put",
+	CommandAppend:  "append",
 	CommandCAS:     "cas",
 }
 

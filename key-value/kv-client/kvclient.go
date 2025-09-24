@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// TODO :-
+// TODO:
 //  the AppendEntries RPC sent by leaders to followers contains a "leader ID"
 //  field; so followers know who the current leader is. We already have it
 //  in our Raft implementation; try to plumb this information all the way
@@ -25,14 +25,25 @@ import (
 
 var DebugClient, _ = strconv.Atoi(os.Getenv("DebugClient"))
 
+// TODO:
+//  change the clientIDs from being integers to uuid for more robustness.
+
 type KVClient struct {
-	addrs    []string
-	clientID int32
+	addrs []string
 
 	// assumedLeader is the index (in addrs) of the service we assume is the
 	// current leader. It is zero-initialized by default, without loss of
 	// generality.
 	assumedLeader int
+
+	// clientID is a unique identifier for a request a specific client; it's
+	// managed internally by incrementing the clientCount global.
+	clientID int64
+
+	// requestID is a unique identifier for a request a specific client makes;
+	// each client manages its own requestID, and increments it monotonically
+	// and atomically each time the user asks to send a new request.
+	requestID atomic.Int64
 }
 
 // NewClient creates a new KVClient. serviceAddrs is the addresses (each a string
@@ -47,7 +58,7 @@ func NewClient(serviceAddrs []string) *KVClient {
 }
 
 // clientCount is used internally for debugging
-var clientCount atomic.Int32
+var clientCount atomic.Int64
 
 // Put the key=value pair into the store. Returns an error, or (prevValue,
 // keyFound, false), where keyFound specifies whether the key was found in
@@ -55,12 +66,30 @@ var clientCount atomic.Int32
 // it was found.
 func (kvc *KVClient) Put(ctx context.Context, key string, value string) (string, bool, error) {
 	req := &api.PutRequest{
-		Key:   key,
-		Value: value,
+		Key:       key,
+		Value:     value,
+		ClientID:  kvc.clientID,
+		RequestID: kvc.requestID.Add(1),
 	}
 	var res api.PutResponse
 	err := kvc.send(ctx, "put", req, &res)
 	return res.PrevValue, res.KeyFound, err
+}
+
+// Append the value to the key in the store. Returns an error, or (prevValue,
+// keyFound, false), where keyFound specifies whether the key was found in
+// the store prior to this command, and prevValue is its previous value if it
+// was found.
+func (kvc *KVClient) Append(ctx context.Context, key string, value string) (string, bool, error) {
+	appendReq := api.AppendRequest{
+		Key:       key,
+		Value:     value,
+		ClientID:  kvc.clientID,
+		RequestID: kvc.requestID.Add(1),
+	}
+	var appendResp api.AppendResponse
+	err := kvc.send(ctx, "append", appendReq, &appendResp)
+	return appendResp.PrevValue, appendResp.KeyFound, err
 }
 
 // Get the value of key from the store. Returns an error, or
@@ -68,7 +97,9 @@ func (kvc *KVClient) Put(ctx context.Context, key string, value string) (string,
 // the store, and value is its value.
 func (kvc *KVClient) Get(ctx context.Context, key string) (string, bool, error) {
 	req := api.GetRequest{
-		Key: key,
+		Key:       key,
+		ClientID:  kvc.clientID,
+		RequestID: kvc.requestID.Add(1),
 	}
 	var resp api.GetResponse
 	err := kvc.send(ctx, "get", req, &resp)
@@ -84,6 +115,8 @@ func (kvc *KVClient) CAS(ctx context.Context, key string, compare string, value 
 		Key:          key,
 		CompareValue: compare,
 		Value:        value,
+		ClientID:     kvc.clientID,
+		RequestID:    kvc.requestID.Add(1),
 	}
 	var resp api.CASResponse
 	err := kvc.send(ctx, "cas", req, &resp)
@@ -101,7 +134,7 @@ FindLeader:
 		// request to the service. If our timeout expires, we move on to try
 		// the next service. In the meantime, we have to keep an eye on
 		// the user context - if that's canceled at any time (due to timeout,
-		// explicit cancellation, etc), we bail out.
+		// explicit cancellation, etc.), we bail out.
 		retryCtx, retryCtxCancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		path := fmt.Sprintf("http://%s/%s", kvc.addrs[kvc.assumedLeader], route)
 
@@ -140,6 +173,9 @@ FindLeader:
 		case api.StatusFailedCommit:
 			retryCtxCancel()
 			return fmt.Errorf("commit failed: please retry")
+		case api.StatusDuplicateRequest:
+			retryCtxCancel()
+			return fmt.Errorf("this request was already completed")
 		default:
 			panic("apparently, I am a crappy programmer. unknown state")
 		}
@@ -176,8 +212,7 @@ func sendJsonRequest(ctx context.Context, path string, reqdata any, resdata any)
 
 func (kvc *KVClient) clogf(format string, args ...any) {
 	if DebugClient > 0 {
-		clientName := fmt.Sprintf("[client:%03d]", kvc.clientID)
-		format = clientName + " " + format
+		format = fmt.Sprintf("[client:%03d] ", kvc.clientID)
 		log.Printf(format, args)
 	}
 }

@@ -1,7 +1,3 @@
-// Test harness for testing the KV service and clients.
-//
-// Eli Bendersky [https://eli.thegreenplace.net]
-// This code is in the public domain.
 package main
 
 import (
@@ -21,8 +17,6 @@ import (
 func init() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
-
-// Test harness for kvservice and client system tests.
 
 type Harness struct {
 	n int
@@ -175,12 +169,11 @@ func (h *Harness) RestartService(id int) {
 	time.Sleep(20 * time.Millisecond)
 }
 
-// DisableHTTPResponsesFromService causes the given service to stop responding
-// to HTTP request from clients (though it will still perform the requested
-// operations).
-func (h *Harness) DisableHTTPResponsesFromService(id int) {
-	tlog("Disabling HTTP responses from %d", id)
-	h.kvCluster[id].ToggleHTTPResponsesEnabled(false)
+// DelayNextHTTPResponseFromService delays the next HTTP response from this
+// service to a client.
+func (h *Harness) DelayNextHTTPResponseFromService(id int) {
+	tlog("Delaying next HTTP response from %d", id)
+	h.kvCluster[id].DelayNextHTTPResponse()
 }
 
 func (h *Harness) Shutdown() {
@@ -270,6 +263,18 @@ func (h *Harness) CheckPut(c *kvclient.KVClient, key, value string) (string, boo
 	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
 	defer cancel()
 	pv, f, err := c.Put(ctx, key, value)
+	if err != nil {
+		h.t.Error(err)
+	}
+	return pv, f
+}
+
+// CheckAppend sends a Append request through client c, and checks there are no
+// errors. Returns (prevValue, keyFound).
+func (h *Harness) CheckAppend(c *kvclient.KVClient, key, value string) (string, bool) {
+	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	defer cancel()
+	pv, f, err := c.Append(ctx, key, value)
 	if err != nil {
 		h.t.Error(err)
 	}

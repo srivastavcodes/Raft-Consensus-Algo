@@ -2,18 +2,21 @@
 // clients. These structs are JSON-encoded into the body of HTTP requests and responses
 // passed between services and clients.
 //
-// Uses bespoke ResponseStatus per response instead of HTTP status codes because
+// Use bespoke ResponseStatus per response instead of HTTP status codes because
 // some statuses like "not leader" or "failed commit" don't have a good match in
 // standard HTTP status codes.
 package api
 
+type Response interface {
+	Status() ResponseStatus
+}
+
 type PutRequest struct {
 	Key   string
 	Value string
-}
 
-type Response interface {
-	Status() ResponseStatus
+	ClientID  int64
+	RequestID int64
 }
 
 type PutResponse struct {
@@ -26,8 +29,29 @@ func (pr *PutResponse) Status() ResponseStatus {
 	return pr.ResponseStatus
 }
 
+type AppendRequest struct {
+	Key   string
+	Value string
+
+	ClientID  int64
+	RequestID int64
+}
+
+type AppendResponse struct {
+	ResponseStatus ResponseStatus
+	KeyFound       bool
+	PrevValue      string
+}
+
+func (ar *AppendResponse) Status() ResponseStatus {
+	return ar.ResponseStatus
+}
+
 type GetRequest struct {
 	Key string
+
+	ClientID  int64
+	RequestID int64
 }
 
 type GetResponse struct {
@@ -44,6 +68,9 @@ type CASRequest struct {
 	Key          string
 	CompareValue string
 	Value        string
+
+	ClientID  int64
+	RequestID int64
 }
 
 type CASResponse struct {
@@ -63,13 +90,15 @@ const (
 	StatusOK
 	StatusNotLeader
 	StatusFailedCommit
+	StatusDuplicateRequest
 )
 
 var responseName = map[ResponseStatus]string{
-	StatusInvalid:      "invalid",
-	StatusOK:           "OK",
-	StatusNotLeader:    "NotLeader",
-	StatusFailedCommit: "FailedCommit",
+	StatusInvalid:          "invalid",
+	StatusOK:               "OK",
+	StatusNotLeader:        "NotLeader",
+	StatusFailedCommit:     "FailedCommit",
+	StatusDuplicateRequest: "DuplicateRequest",
 }
 
 func (rs ResponseStatus) String() string {

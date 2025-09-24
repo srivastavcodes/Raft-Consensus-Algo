@@ -13,13 +13,14 @@ import (
 	"raft/raft"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
 var (
-	_          = godotenv.Load("../.envrc")
+	_          = godotenv.Load(".envrc")
 	DebugKv, _ = strconv.Atoi(os.Getenv("DebugKv"))
 )
 
@@ -46,9 +47,16 @@ type KVService struct {
 	// srv is the HTTP server exposed by the service to the external world.
 	srv *http.Server
 
-	// httpResponseEnabled controls whether this service returns HTTP responses
-	// to the client. It's only used for testing and debugging.
-	httpResponseEnabled bool
+	// lastRequestIDPerClient helps de-duplicate client requests. It stores the
+	// last request ID that was applied by the updater per client; the assumption
+	// is that client IDs are unique (keys in this map), and for each client the
+	// requests IDs (values in this map) are unique and monotonically increasing.
+	lastRequestIDPerClient map[int64]int64
+
+	// delayNextHTTPResponse will be on when the service was requested to delay
+	// its next HTTP response to the client. This flips back to off after use.
+	// Used for testing.
+	delayNextHTTPResponse atomic.Bool
 }
 
 // NewService creates a new KVService
@@ -67,12 +75,12 @@ func NewService(id int, peerIds []int, storage raft.Storage, readyChan <-chan an
 	rs := raft.NewServer(id, peerIds, storage, readyChan, commitChan)
 	rs.Serve()
 	kvs := &KVService{
-		id:                  id,
-		rs:                  rs,
-		commitChan:          commitChan,
-		commitSubs:          make(map[int]chan Command),
-		ds:                  NewDataStore(),
-		httpResponseEnabled: true,
+		id:                     id,
+		rs:                     rs,
+		commitChan:             commitChan,
+		commitSubs:             make(map[int]chan Command),
+		ds:                     NewDataStore(),
+		lastRequestIDPerClient: make(map[int64]int64),
 	}
 	kvs.runUpdater()
 	return kvs
@@ -90,6 +98,7 @@ func (kvs *KVService) ServeHTTP(port int) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /put", kvs.handlePut)
+	mux.HandleFunc("POST /append", kvs.handleAppend)
 	mux.HandleFunc("POST /get", kvs.handleGet)
 	mux.HandleFunc("POST /cas", kvs.handleCAS)
 	kvs.srv = &http.Server{
@@ -105,18 +114,21 @@ func (kvs *KVService) ServeHTTP(port int) {
 	}()
 }
 
-// ToggleHTTPResponsesEnabled controls whether this service returns HTTP
-// responses to clients. It's always enabled during normal operation.
-// For testing and debugging purposes, this method can be called with false;
-// then, the service will not respond to clients over HTTP.
-func (kvs *KVService) ToggleHTTPResponsesEnabled(enable bool) {
-	kvs.httpResponseEnabled = enable
+// DelayNextHTTPResponse instructs the service to delay the response to the
+// next HTTP request from the client. The service still acts on the request
+// as usual, just the HTTP response is delayed. This only applies to a
+// single response - the bit flips back to off after use.
+func (kvs *KVService) DelayNextHTTPResponse() {
+	kvs.delayNextHTTPResponse.Store(true)
 }
 
-func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
-	if kvs.httpResponseEnabled {
-		renderJSON(w, v)
+func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, res any) {
+	if kvs.delayNextHTTPResponse.Load() {
+		kvs.delayNextHTTPResponse.Store(false)
+		time.Sleep(300 * time.Millisecond)
 	}
+	kvs.kvlogf("sending response %#v", res)
+	renderJSON(w, res)
 }
 
 func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
@@ -130,10 +142,12 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	// Submit a command into the raft server; this is the state change in the
 	// replicated state machine built on top of the raft log.
 	cmd := Command{
-		Kind:  CommandPut,
-		Key:   pr.Key,
-		Value: pr.Value,
-		Id:    kvs.id,
+		CmdKind:   CommandPut,
+		Key:       pr.Key,
+		Value:     pr.Value,
+		ServiceID: kvs.id,
+		ClientID:  pr.ClientID,
+		RequestID: pr.RequestID,
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	// If we're not the raft leader, send an appropriate status.
@@ -155,16 +169,69 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 		// If this is our command, then all is good! If it's some other server's
 		// command, this means we lost leadership at some point and should
 		// return an error.
-		if commitCmd.Id == kvs.id {
-			renderJSON(w, api.PutResponse{
-				ResponseStatus: api.StatusOK,
-				KeyFound:       commitCmd.ResultFound,
-				PrevValue:      commitCmd.ResultValue,
-			})
+		if commitCmd.ServiceID == kvs.id {
+			if commitCmd.IsDuplicate {
+				// If this command is a duplicate, it wasn't executed as a result of
+				// this request. Notify the client with a special status.
+				kvs.sendHTTPResponse(w, api.PutResponse{
+					ResponseStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				renderJSON(w, api.PutResponse{
+					ResponseStatus: api.StatusOK,
+					KeyFound:       commitCmd.ResultFound,
+					PrevValue:      commitCmd.ResultValue,
+				})
+			}
 		} else {
-			renderJSON(w, api.PutResponse{
-				ResponseStatus: api.StatusFailedCommit,
-			})
+			kvs.sendHTTPResponse(w, api.PutResponse{ResponseStatus: api.StatusFailedCommit})
+		}
+	case <-req.Context().Done():
+		return
+	}
+}
+
+// The details of these handlers are very similar to handlePut: refer to that
+// function for detailed comments.
+func (kvs *KVService) handleAppend(w http.ResponseWriter, req *http.Request) {
+	ar := &api.AppendRequest{}
+	if err := readRequestJSON(req, ar); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlogf("HTTP APPEND %v", ar)
+
+	cmd := Command{
+		CmdKind:   CommandAppend,
+		Key:       ar.Key,
+		Value:     ar.Value,
+		ServiceID: kvs.id,
+		ClientID:  ar.ClientID,
+		RequestID: ar.RequestID,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		kvs.sendHTTPResponse(w, api.AppendResponse{ResponseStatus: api.StatusNotLeader})
+		return
+	}
+	sub := kvs.createCommitSubscription(logIndex)
+
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.ServiceID == kvs.id {
+			if commitCmd.IsDuplicate {
+				kvs.sendHTTPResponse(w, api.AppendResponse{
+					ResponseStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				kvs.sendHTTPResponse(w, api.AppendResponse{
+					ResponseStatus: api.StatusOK,
+					KeyFound:       commitCmd.ResultFound,
+					PrevValue:      commitCmd.ResultValue,
+				})
+			}
+		} else {
+			kvs.sendHTTPResponse(w, api.AppendResponse{ResponseStatus: api.StatusFailedCommit})
 		}
 	case <-req.Context().Done():
 		return
@@ -182,9 +249,11 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	kvs.kvlogf("HTTP GET %v", gr)
 
 	cmd := Command{
-		Kind: CommandGet,
-		Key:  gr.Key,
-		Id:   kvs.id,
+		CmdKind:   CommandGet,
+		Key:       gr.Key,
+		ServiceID: kvs.id,
+		ClientID:  gr.ClientID,
+		RequestID: gr.RequestID,
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	if logIndex < 0 {
@@ -192,14 +261,21 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	sub := kvs.createCommitSubscription(logIndex)
+
 	select {
 	case commitCmd := <-sub:
-		if commitCmd.Id == kvs.id {
-			kvs.sendHTTPResponse(w, api.GetResponse{
-				ResponseStatus: api.StatusOK,
-				KeyFound:       commitCmd.ResultFound,
-				Value:          commitCmd.ResultValue,
-			})
+		if commitCmd.ServiceID == kvs.id {
+			if commitCmd.IsDuplicate {
+				kvs.sendHTTPResponse(w, api.GetResponse{
+					ResponseStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				kvs.sendHTTPResponse(w, api.GetResponse{
+					ResponseStatus: api.StatusOK,
+					KeyFound:       commitCmd.ResultFound,
+					Value:          commitCmd.ResultValue,
+				})
+			}
 		} else {
 			kvs.sendHTTPResponse(w, api.GetResponse{ResponseStatus: api.StatusFailedCommit})
 		}
@@ -217,11 +293,13 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	kvs.kvlogf("HTTP CAS %v", cr)
 
 	cmd := Command{
-		Kind:         CommandCAS,
+		CmdKind:      CommandCAS,
 		Key:          cr.Key,
 		Value:        cr.Value,
 		CompareValue: cr.CompareValue,
-		Id:           kvs.id,
+		ServiceID:    kvs.id,
+		ClientID:     cr.ClientID,
+		RequestID:    cr.RequestID,
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	if logIndex < 0 {
@@ -229,14 +307,21 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	sub := kvs.createCommitSubscription(logIndex)
+
 	select {
 	case commitCmd := <-sub:
-		if commitCmd.Id == kvs.id {
-			kvs.sendHTTPResponse(w, api.CASResponse{
-				ResponseStatus: api.StatusOK,
-				KeyFound:       commitCmd.ResultFound,
-				PrevValue:      commitCmd.ResultValue,
-			})
+		if commitCmd.ServiceID == kvs.id {
+			if commitCmd.IsDuplicate {
+				kvs.sendHTTPResponse(w, api.CASResponse{
+					ResponseStatus: api.StatusDuplicateRequest,
+				})
+			} else {
+				kvs.sendHTTPResponse(w, api.CASResponse{
+					ResponseStatus: api.StatusOK,
+					KeyFound:       commitCmd.ResultFound,
+					PrevValue:      commitCmd.ResultValue,
+				})
+			}
 		} else {
 			kvs.sendHTTPResponse(w, api.CASResponse{ResponseStatus: api.StatusFailedCommit})
 		}
@@ -279,15 +364,28 @@ func (kvs *KVService) runUpdater() {
 	go func() {
 		for entry := range kvs.commitChan {
 			cmd := entry.Command.(Command)
-			switch cmd.Kind {
-			case CommandPut:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
-			case CommandGet:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
-			case CommandCAS:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
-			default:
-				panic(fmt.Errorf("unexpected command %v", cmd))
+
+			lastreqID, ok := kvs.lastRequestIDPerClient[cmd.ClientID]
+			if ok && lastreqID >= cmd.RequestID {
+				kvs.kvlogf("duplicate request id =%v, from client id=%v", cmd.RequestID, cmd.ClientID)
+				cmd = Command{
+					CmdKind:     cmd.CmdKind,
+					IsDuplicate: true,
+				}
+			} else {
+				kvs.lastRequestIDPerClient[cmd.ClientID] = cmd.RequestID
+				switch cmd.CmdKind {
+				case CommandPut:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
+				case CommandAppend:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Append(cmd.Key, cmd.Value)
+				case CommandGet:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
+				case CommandCAS:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
+				default:
+					panic(fmt.Errorf("unexpected command %v", cmd))
+				}
 			}
 			// Forward this entry to the subscriber interested in its index, and
 			// close the subscription - it's single-use.
