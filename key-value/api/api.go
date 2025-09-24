@@ -31,13 +31,13 @@ type GetRequest struct {
 }
 
 type GetResponse struct {
-	RespStatus ResponseStatus
-	KeyFound   bool
-	Value      string
+	ResponseStatus ResponseStatus
+	KeyFound       bool
+	Value          string
 }
 
 func (gr *GetResponse) Status() ResponseStatus {
-	return gr.RespStatus
+	return gr.ResponseStatus
 }
 
 type CASRequest struct {
@@ -47,13 +47,13 @@ type CASRequest struct {
 }
 
 type CASResponse struct {
-	RespStatus ResponseStatus
-	KeyFound   bool
-	PrevValue  string
+	ResponseStatus ResponseStatus
+	KeyFound       bool
+	PrevValue      string
 }
 
 func (cr *CASResponse) Status() ResponseStatus {
-	return cr.RespStatus
+	return cr.ResponseStatus
 }
 
 type ResponseStatus int

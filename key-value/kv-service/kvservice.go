@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	_          = godotenv.Load(".envrc")
+	_          = godotenv.Load("../.envrc")
 	DebugKv, _ = strconv.Atoi(os.Getenv("DebugKv"))
 )
 
@@ -74,7 +74,7 @@ func NewService(id int, peerIds []int, storage raft.Storage, readyChan <-chan an
 		ds:                  NewDataStore(),
 		httpResponseEnabled: true,
 	}
-	// kvs.runUpdater()
+	kvs.runUpdater()
 	return kvs
 }
 
@@ -89,9 +89,9 @@ func (kvs *KVService) ServeHTTP(port int) {
 		panic("ServeHTTP called with existing server")
 	}
 	mux := http.NewServeMux()
-	// mux.HandleFunc("POST /get/", kvs.handleGet)
-	// mux.HandleFunc("POST /put/", kvs.handlePut)
-	// mux.HandleFunc("POST /cas/", kvs.handleCAS)
+	mux.HandleFunc("POST /put", kvs.handlePut)
+	mux.HandleFunc("POST /get", kvs.handleGet)
+	mux.HandleFunc("POST /cas", kvs.handleCAS)
 	kvs.srv = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
@@ -188,7 +188,7 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	if logIndex < 0 {
-		kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusNotLeader})
+		kvs.sendHTTPResponse(w, api.GetResponse{ResponseStatus: api.StatusNotLeader})
 		return
 	}
 	sub := kvs.createCommitSubscription(logIndex)
@@ -196,12 +196,12 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	case commitCmd := <-sub:
 		if commitCmd.Id == kvs.id {
 			kvs.sendHTTPResponse(w, api.GetResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				Value:      commitCmd.ResultValue,
+				ResponseStatus: api.StatusOK,
+				KeyFound:       commitCmd.ResultFound,
+				Value:          commitCmd.ResultValue,
 			})
 		} else {
-			kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
+			kvs.sendHTTPResponse(w, api.GetResponse{ResponseStatus: api.StatusFailedCommit})
 		}
 	case <-req.Context().Done():
 		return
@@ -225,7 +225,7 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	}
 	logIndex := kvs.rs.Submit(cmd)
 	if logIndex < 0 {
-		kvs.sendHTTPResponse(w, api.PutResponse{ResponseStatus: api.StatusNotLeader})
+		kvs.sendHTTPResponse(w, api.CASResponse{ResponseStatus: api.StatusNotLeader})
 		return
 	}
 	sub := kvs.createCommitSubscription(logIndex)
@@ -233,12 +233,12 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	case commitCmd := <-sub:
 		if commitCmd.Id == kvs.id {
 			kvs.sendHTTPResponse(w, api.CASResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				PrevValue:  commitCmd.ResultValue,
+				ResponseStatus: api.StatusOK,
+				KeyFound:       commitCmd.ResultFound,
+				PrevValue:      commitCmd.ResultValue,
 			})
 		} else {
-			kvs.sendHTTPResponse(w, api.CASResponse{RespStatus: api.StatusFailedCommit})
+			kvs.sendHTTPResponse(w, api.CASResponse{ResponseStatus: api.StatusFailedCommit})
 		}
 	case <-req.Context().Done():
 		return
