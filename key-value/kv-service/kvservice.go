@@ -105,6 +105,20 @@ func (kvs *KVService) ServeHTTP(port int) {
 	}()
 }
 
+// ToggleHTTPResponsesEnabled controls whether this service returns HTTP
+// responses to clients. It's always enabled during normal operation.
+// For testing and debugging purposes, this method can be called with false;
+// then, the service will not respond to clients over HTTP.
+func (kvs *KVService) ToggleHTTPResponsesEnabled(enable bool) {
+	kvs.httpResponseEnabled = enable
+}
+
+func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
+	if kvs.httpResponseEnabled {
+		renderJSON(w, v)
+	}
+}
+
 func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	pr := &api.PutRequest{}
 	if err := readRequestJSON(req, pr); err != nil {
@@ -151,6 +165,80 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 			renderJSON(w, api.PutResponse{
 				ResponseStatus: api.StatusFailedCommit,
 			})
+		}
+	case <-req.Context().Done():
+		return
+	}
+}
+
+// The details of these handlers are very similar to handlePut: refer to that
+// function for detailed comments.
+func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
+	gr := &api.GetRequest{}
+	if err := readRequestJSON(req, gr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlogf("HTTP GET %v", gr)
+
+	cmd := Command{
+		Kind: CommandGet,
+		Key:  gr.Key,
+		Id:   kvs.id,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusNotLeader})
+		return
+	}
+	sub := kvs.createCommitSubscription(logIndex)
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.Id == kvs.id {
+			kvs.sendHTTPResponse(w, api.GetResponse{
+				RespStatus: api.StatusOK,
+				KeyFound:   commitCmd.ResultFound,
+				Value:      commitCmd.ResultValue,
+			})
+		} else {
+			kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
+		}
+	case <-req.Context().Done():
+		return
+	}
+}
+
+func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
+	cr := &api.CASRequest{}
+	if err := readRequestJSON(req, cr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	kvs.kvlogf("HTTP CAS %v", cr)
+
+	cmd := Command{
+		Kind:         CommandCAS,
+		Key:          cr.Key,
+		Value:        cr.Value,
+		CompareValue: cr.CompareValue,
+		Id:           kvs.id,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		kvs.sendHTTPResponse(w, api.PutResponse{ResponseStatus: api.StatusNotLeader})
+		return
+	}
+	sub := kvs.createCommitSubscription(logIndex)
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.Id == kvs.id {
+			kvs.sendHTTPResponse(w, api.CASResponse{
+				RespStatus: api.StatusOK,
+				KeyFound:   commitCmd.ResultFound,
+				PrevValue:  commitCmd.ResultValue,
+			})
+		} else {
+			kvs.sendHTTPResponse(w, api.CASResponse{RespStatus: api.StatusFailedCommit})
 		}
 	case <-req.Context().Done():
 		return
